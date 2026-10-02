@@ -14,6 +14,7 @@ from .schemas import (
     BatchVoidIn,
     CleaningCorrection,
     HandoverIn,
+    HandoverReviewIn,
     LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
@@ -277,6 +278,40 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def get_batch_handover(batch_no: str, service: Service = Depends(svc)):
         """追溯单批的交接归属（未发运返回 shipped=false；未知批次 404）。"""
         return service.get_batch_handover(batch_no)
+
+    # ---------------- 发运后复核（已发运批次风险复核） ----------------
+
+    @app.get("/api/handovers/{handover_no}/review", tags=["发运后复核"])
+    def get_handover_review(handover_no: str, service: Service = Depends(svc)):
+        """发运后复核看板：按交接号逐批并列交接时冻结的裁决/出货资格快照与
+        当前版本、结论及作废状态。
+
+        相较交接快照，任一版本变化或批次作废均形成复核事项（即使结论仍为 RELEASE）；
+        每批给出复核状态（NOT_REQUIRED / PENDING_REVIEW / REVIEWED）、
+        复核事项原因与只追加的处置历史。未知交接 404。
+        """
+        return service.get_handover_review(handover_no)
+
+    @app.post("/api/handovers/{handover_no}/review", tags=["发运后复核"], status_code=201)
+    def record_handover_review(
+        handover_no: str, body: HandoverReviewIn, service: Service = Depends(svc)
+    ):
+        """质检员凭所见两类当前版本与作废状态，对待复核批次记录处置
+        （需召回 / 无需召回 + 非空原因）。
+
+        处置针对所见状态记入只追加历史后显示已复核；后续版本变化或新作废再次待复核。
+        同一状态不得重复处置；未知交接或非其批次、过期所见状态、空原因、
+        当前无复核事项均拒绝且不写入。交接快照与原核验流程保持不变。
+        """
+        return service.record_handover_review(
+            handover_no,
+            body.batch_no,
+            body.decision,
+            body.reason,
+            body.expected_adjudication_version,
+            body.expected_shipment_version,
+            body.expected_voided,
+        )
 
     return app
 

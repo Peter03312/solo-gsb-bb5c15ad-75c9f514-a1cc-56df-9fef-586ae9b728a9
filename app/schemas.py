@@ -74,3 +74,26 @@ class HandoverIn(BaseModel):
         ge=1,
         description="工作人员所见单据修订号（读取时修订号，乐观并发）；交接仅接受仍为 CONFIRMED 且修订号匹配的单据，否则整体拒绝（VERIFICATION_REVISION_CONFLICT）",
     )
+
+
+class HandoverReviewIn(BaseModel):
+    batch_no: str = Field(..., description="待复核处置的批次号（须属于该交接记录）")
+    decision: str = Field(
+        ...,
+        description="处置结论：RECALL_REQUIRED=需召回 / NO_RECALL_NEEDED=无需召回",
+    )
+    reason: str = Field(..., description="处置原因（必填，不允许空白）")
+    expected_adjudication_version: int = Field(
+        ...,
+        ge=1,
+        description="质检员所见当前裁决版本（乐观并发）；与当前不一致整体拒绝（REVIEW_STATE_CONFLICT）",
+    )
+    expected_shipment_version: int = Field(
+        ...,
+        ge=1,
+        description="质检员所见当前出货资格版本（乐观并发）；与当前不一致整体拒绝（REVIEW_STATE_CONFLICT）",
+    )
+    expected_voided: bool = Field(
+        ...,
+        description="质检员所见作废状态（true=已作废）；与当前不一致整体拒绝（REVIEW_STATE_CONFLICT）",
+    )

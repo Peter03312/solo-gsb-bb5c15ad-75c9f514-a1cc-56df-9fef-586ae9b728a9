@@ -246,6 +246,25 @@ CREATE TABLE IF NOT EXISTS shipment_handover_occupancy (
 
 CREATE INDEX IF NOT EXISTS idx_hoccupancy_handover
     ON shipment_handover_occupancy(handover_no);
+
+-- 发运后复核：已发运批次在后续更正/批号待检锁定/作废后，质检逐批处置的只追加历史。
+-- 每条处置针对一个“所见状态”（当前裁决版本 + 当前出货资格版本 + 作废标记）：
+-- 同一状态不得重复处置；后续版本变化或新作废形成新状态，需再次处置。
+CREATE TABLE IF NOT EXISTS shipment_handover_review (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    handover_no           TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    batch_no              TEXT NOT NULL REFERENCES batch(batch_no),
+    -- 本次处置针对的所见状态（质检员提交时核对一致的当前状态）
+    adjudication_version  INTEGER NOT NULL,
+    shipment_version      INTEGER NOT NULL,
+    voided                INTEGER NOT NULL,          -- 1=已作废 / 0=有效
+    decision              TEXT NOT NULL,             -- RECALL_REQUIRED=需召回 / NO_RECALL_NEEDED=无需召回
+    reason                TEXT NOT NULL,             -- 非空处置原因
+    decided_at            TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hreview_handover
+    ON shipment_handover_review(handover_no, batch_no);
 """
 
 # 初始化空库时写入的参考原料批号（不影响裁决的演示样例）
