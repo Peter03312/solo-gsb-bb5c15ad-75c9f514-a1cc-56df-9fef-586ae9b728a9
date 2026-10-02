@@ -74,3 +74,28 @@ class HandoverIn(BaseModel):
         ge=1,
         description="工作人员所见单据修订号（读取时修订号，乐观并发）；交接仅接受仍为 CONFIRMED 且修订号匹配的单据，否则整体拒绝（VERIFICATION_REVISION_CONFLICT）",
     )
+
+
+class ShipmentReviewDecisionIn(BaseModel):
+    seen_adjudication_version: int = Field(
+        ...,
+        ge=1,
+        description="质检员查询复核事项时所见的批次当前裁决版本（乐观并发；过期即整体拒绝 REVIEW_STATE_STALE）",
+    )
+    seen_shipment_version: int = Field(
+        ...,
+        ge=1,
+        description="质检员查询复核事项时所见的批次当前出货资格版本（乐观并发；过期即整体拒绝 REVIEW_STATE_STALE）",
+    )
+    seen_batch_voided: bool = Field(
+        ...,
+        description="质检员查询复核事项时所见的批次作废状态（true=已作废 / false=有效；与实际不符即 REVIEW_STATE_STALE）",
+    )
+    disposition: str = Field(
+        ...,
+        description="复核处置：RECALL_REQUIRED=需召回，NO_RECALL=无需召回；其他值拒绝（INVALID_PAYLOAD）",
+    )
+    reason: str = Field(
+        ...,
+        description="处置原因（必填，不允许空白）；空或纯空白原因整体拒绝（INVALID_PAYLOAD）且不写入",
+    )

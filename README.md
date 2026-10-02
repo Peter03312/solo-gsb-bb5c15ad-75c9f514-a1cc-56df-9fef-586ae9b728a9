@@ -245,6 +245,34 @@
 `mustard`（芥末）、`sesame`（芝麻）、`sulphites`（亚硫酸盐）、`lupin`（羽扇豆）、
 `molluscs`（软体动物）。完整清单可通过 `GET /api/allergens` 查询。
 
+### 已发运批次发运后质量复核
+
+批次在完成**装车交接**后，仍可能发生后续更正（追加裁决版本）、原料批号待检锁定
+（递进出货资格版本）或批次作废。质检需**按交接号逐批复核**已发运批次的召回风险
+（`GET /api/handovers/{handover_no}/reviews`）：
+
+- **逐批并列**交接时冻结的裁决快照、出货资格快照与**当前版本、结论及批次作废状态**。
+  相较交接快照，**任一版本变化或批次作废**都形成复核事项——**即使当前结论仍为 RELEASE**；
+  无任何变化的批次为 `NO_REVIEW_REQUIRED`（无需复核）。
+- 复核事项状态：`PENDING_REVIEW`（待复核）→ 质检员凭查询时**所见的两类当前版本与作废状态**
+  （`seen_adjudication_version` / `seen_shipment_version` / `seen_batch_voided`）提交处置
+  （`POST /api/handovers/{handover_no}/reviews/{batch_no}/decision`）：
+  - `disposition=RECALL_REQUIRED`（**需召回**）或 `NO_RECALL`（**无需召回**），并填写
+    **非空** `reason`；
+  - 处置写入**只追加**历史后该批次对当前所见状态显示 `REVIEWED`（已复核）；
+  - **后续版本变化或新作废**产生新的所见状态时，批次**再次待复核**，可再追加一条处置；
+    历次处置记录全部保留。
+- **同一状态不得重复处置**：同一交接+批次+所见三类状态至多一条处置记录（唯一索引兜底，
+  含并发竞争）。
+- **拒绝且不写入**：未知交接 404（`HANDOVER_NOT_FOUND`）、批次不属于该交接 404
+  （`BATCH_NOT_IN_HANDOVER`）、空/纯空白原因或非法处置结论 400（`INVALID_PAYLOAD`）、
+  对无变化状态处置 409（`REVIEW_NOT_REQUIRED`）、同一状态重复处置 409
+  （`REVIEW_ALREADY_RECORDED`）、所见状态已过期 409（`REVIEW_STATE_STALE`，
+  `details.stale_fields` 指明哪类所见信息与当前不一致，需重新查询后再处置）。
+- **交接快照和原核验流程保持不变**：复核只读交接冻结快照、只追加自己的处置表，
+  不改写交接记录/逐批冻结快照，也不改动核验单与交接占用；作废批次在复核视图中仍保留
+  其冻结的裁决/资格记录与作废原因。
+
 ---
 
 ## 2. 一键启动（Docker Compose，推荐）
@@ -276,7 +304,7 @@ python -m app
 
 ```bash
 pip install pytest httpx
-python -m pytest -q            # 141 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、出货前批次清单修订（乐观修订号/同事务快照/并发一致性）、旧库升级
+python -m pytest -q            # 178 个用例：裁决、传递、更正重算、历史、原子性、产线隔离、批号锁定、出货资格、出货核验单、批次作废、误归产线更正换线、清洁更正预演（只读）、出货前批次清单修订（乐观修订号/同事务快照/并发一致性）、装车交接、已发运批次发运后质量复核（逐批快照对比/只追加处置/同状态不重复/过期所见拒绝/旧库升级）、旧库升级
 
 # 服务启动后，运行端到端调用示例（标准库 urllib，无需额外依赖）
 python examples/run_demo.py
@@ -310,6 +338,12 @@ BASE_URL=http://127.0.0.1:8080 python examples/verification_revise_demo.py
 #   已发运整单拒绝不留部分占用/交接后更正不改写记录/逐批归属追溯）
 python examples/shipment_handover_demo.py
 BASE_URL=http://127.0.0.1:8080 python examples/shipment_handover_demo.py
+
+# 已发运批次发运后质量复核端到端示例（按交接号逐批并列冻结快照与当前版本/作废状态、
+#   版本变化或作废即待复核即使仍放行、凭所见两类当前版本+作废状态记录需召回/无需召回与原因、
+#   只追加历史、后续变化再次待复核、同状态不重复、过期所见/未知交接/非其批次/空原因拒绝）
+python examples/shipment_review_demo.py
+BASE_URL=http://127.0.0.1:8080 python examples/shipment_review_demo.py
 ```
 
 ---
@@ -818,6 +852,70 @@ DRAFT ──confirm 成功──▶ CONFIRMED
 交接拒绝码见上文[业务规则](#装车交接整单发运)；全部在单事务内校验，失败整体回滚、
 不留下部分占用。
 
+### 已发运批次发运后质量复核
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/handovers/{handover_no}/reviews` | 按交接号逐批查询复核事项：并列交接冻结快照与当前版本/结论/作废状态，给出 `review_status`、`seen_state` 与只追加处置历史；未知交接 404 |
+| POST | `/api/handovers/{handover_no}/reviews/{batch_no}/decision` | 凭所见两类当前版本+作废状态记录复核处置（需召回/无需召回+非空原因，201）；同一状态不重复、过期所见、无变化状态均拒绝且不写入 |
+
+复核处置请求体：
+
+```json
+{
+  "seen_adjudication_version": 2,
+  "seen_shipment_version": 2,
+  "seen_batch_voided": false,
+  "disposition": "RECALL_REQUIRED",
+  "reason": "直接使用的原料批号待检锁定，已发运产品需召回"
+}
+```
+
+- `disposition`：`RECALL_REQUIRED`（需召回）/ `NO_RECALL`（无需召回）；
+- 三个 `seen_*` 字段取自查询复核事项时对应批次的 `seen_state`（乐观并发，提交时须与
+  数据库当前状态一致）；`reason` 必填、不允许空白。
+
+`GET .../reviews` 逐批事项（`batches[]`，按交接清单顺序）关键字段：
+
+```jsonc
+{
+  "position": 1, "batch_no": "B002",
+  "status": "ACTIVE", "voided": false,
+  "handover_snapshot": {            // 交接时冻结、不可变
+    "adjudication":         { "version": 1, "disposition": "RELEASE", /* actual/undeclared/reasons */ },
+    "shipment_eligibility": { "version": 1, "status": "SHIPPABLE", "locked_lots": [], "reasons": [] }
+  },
+  "current": {                      // 当前版本与结论（质检员所见的两类当前版本）
+    "adjudication":         { "version": 2, "disposition": "RELEASE", /* ... */ },
+    "shipment_eligibility": { "version": 2, "status": "BLOCKED", "locked_lots": ["RM-..."], "reasons": [] }
+  },
+  "adjudication_changed": true,
+  "shipment_eligibility_changed": true,
+  "change_reasons": [ /* 快照后各裁决版本的变化原因；作废时含 BATCH_VOIDED 条目 */ ],
+  "shipment_change_reasons": [ /* 快照后各出货资格版本的变化原因 */ ],
+  "needs_review": true,
+  "review_status": "PENDING_REVIEW",   // PENDING_REVIEW / REVIEWED / NO_REVIEW_REQUIRED
+  "seen_state": { "adjudication_version": 2, "shipment_version": 2, "batch_voided": false },
+  "latest_review": null,               // 当前所见状态已处置时为最近一次处置
+  "reviews": [ /* 只追加的历次处置：seen_state/disposition/disposition_label/reason/reviewed_at */ ]
+}
+```
+
+顶层 `summary` 给出 `pending_review` / `reviewed` / `no_review_required` 计数与
+`pending_batches` / `reviewed_batches` 批次号列表。处置成功（201）返回
+`{ handover_no, review_id, reviewed: true, batch: <该批最新事项> }`。
+
+复核拒绝码：
+
+| 场景 | HTTP | error.code |
+| --- | --- | --- |
+| 交接记录不存在 | 404 | `HANDOVER_NOT_FOUND` |
+| 批次不属于该交接（含未知批次） | 404 | `BATCH_NOT_IN_HANDOVER` |
+| 处置结论非法 / 原因为空或纯空白 | 400 | `INVALID_PAYLOAD` |
+| 相较交接快照无变化，不构成复核事项 | 409 | `REVIEW_NOT_REQUIRED` |
+| 同一所见状态已处置（含并发竞争） | 409 | `REVIEW_ALREADY_RECORDED` |
+| 所见两类当前版本/作废状态已过期 | 409 | `REVIEW_STATE_STALE`（`details[0].stale_fields` 指明 `adjudication_version` / `shipment_version` / `batch_voided`） |
+
 ---
 
 ## 8. curl 调用示例
@@ -959,6 +1057,23 @@ curl -s -X POST http://127.0.0.1:8080/api/handovers \
 curl -s http://127.0.0.1:8080/api/handovers/HO-001
 curl -s 'http://127.0.0.1:8080/api/handovers?verification_no=SH-001'
 curl -s http://127.0.0.1:8080/api/batches/B001/handover
+
+# 27) 已发运批次发运后复核：按交接号逐批并列交接冻结快照与当前版本/结论/作废状态
+#     （任一版本变化或批次作废即 PENDING_REVIEW，即使结论仍 RELEASE；取批次的 seen_state）
+curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews
+
+# 28) 质检员凭所见两类当前版本（裁决/出货资格）与作废状态，对 PENDING_REVIEW 批次
+#     记录“需召回(RECALL_REQUIRED)”或“无需召回(NO_RECALL)”与非空原因 -> 201，
+#     只追加历史后显示已复核；后续版本变化或新作废会再次待复核
+curl -s -X POST http://127.0.0.1:8080/api/handovers/HO-001/reviews/B001/decision \
+  -H 'Content-Type: application/json' \
+  -d '{"seen_adjudication_version":2,"seen_shipment_version":2,"seen_batch_voided":false,
+       "disposition":"RECALL_REQUIRED","reason":"直接使用的原料批号待检锁定，已发运产品需召回"}'
+
+# 29) 拒绝：同一状态重复处置 409 REVIEW_ALREADY_RECORDED；过期所见状态
+#     409 REVIEW_STATE_STALE（details.stale_fields 指明哪类不一致，重新查询取新 seen_state）；
+#     无变化状态处置 409 REVIEW_NOT_REQUIRED；未知交接/非其批次 404；空原因/非法结论 400；均不写入
+curl -s http://127.0.0.1:8080/api/handovers/HO-001/reviews   # 重新查询获取最新 seen_state 后再处置
 ```
 
 更多可运行示例见 [`examples/run_demo.py`](examples/run_demo.py)（包含完整的
@@ -985,7 +1100,12 @@ curl -s http://127.0.0.1:8080/api/batches/B001/handover
 装车交接（整单发运）全流程示例见 [`examples/shipment_handover_demo.py`](examples/shipment_handover_demo.py)
 （唯一交接号 + 读取时修订号 → 冻结单号/修订号/逐批确认快照 →
 重复交接号/未知单据/非已确认/修订号冲突拒绝 → 已发运批次整单拒绝不留部分占用 →
-交接后更正不改写记录 → 列表/详情/逐批归属追溯）。
+交接后更正不改写记录 → 列表/详情/逐批归属追溯）；
+已发运批次发运后质量复核全流程示例见 [`examples/shipment_review_demo.py`](examples/shipment_review_demo.py)
+（按交接号逐批并列冻结快照与当前版本/作废状态 → 待检锁定/作废/裁决新版本即待复核
+即使仍放行 → 凭所见两类当前版本+作废状态记录需召回/无需召回与非空原因 →
+只追加历史、已复核后新变化再次待复核 → 同一状态不重复、过期所见/未知交接/非其批次/
+空原因/非法结论拒绝 → 交接冻结快照始终不变）。
 示例脚本可重复调用其中的“登记原料批号”接口（重复时自动跳过）；批次号固定，
 重复运行前如需重置可 `docker compose down -v` 后重新启动，或删除本地 `data/` 目录。
 
@@ -1000,7 +1120,7 @@ curl -s http://127.0.0.1:8080/api/batches/B001/handover
 │   ├── allergens.py     # 14 项过敏原受控字典
 │   ├── errors.py        # 业务错误（code + HTTP 状态码）
 │   ├── db.py            # SQLite 连接、建表、事务、初始化/种子
-│   ├── service.py       # 核心规则：传递/清洁/裁决、更正重算、历史版本、出货核验单、装车交接
+│   ├── service.py       # 核心规则：传递/清洁/裁决、更正重算、历史版本、出货核验单、装车交接、发运后复核
 │   ├── schemas.py       # 请求模型
 │   ├── main.py          # FastAPI 路由
 │   └── __main__.py      # python -m app 入口
@@ -1010,6 +1130,7 @@ curl -s http://127.0.0.1:8080/api/batches/B001/handover
 ├── examples/batch_void_demo.py   # 误登记批次作废端到端调用示例
 ├── examples/batch_reassign_demo.py # 误归产线更正（换线）端到端调用示例
 ├── examples/shipment_handover_demo.py # 装车交接（整单发运/冻结快照/占用追溯）端到端调用示例
+├── examples/shipment_review_demo.py # 已发运批次发运后质量复核（逐批对比/只追加处置/乐观所见）端到端调用示例
 ├── examples/verification_revise_demo.py # 出货前批次清单修订（乐观修订号）端到端调用示例
 ├── examples/cleaning_preview_demo.py # 开工前清洁更正预演（只读）端到端调用示例
 ├── tests/test_service.py         # pytest 测试（裁决/更正/历史，20 项）
@@ -1020,6 +1141,7 @@ curl -s http://127.0.0.1:8080/api/batches/B001/handover
 ├── tests/test_batch_reassign.py  # pytest 测试（误归产线换线/两线重算/历史归属/资格不递增/核验单联动/原子性，26 项）
 ├── tests/test_cleaning_preview.py # pytest 测试（清洁更正预演：逐批推演/版本影响范围/跳过作废批/锁定不参与/只读性/与正式更正一致/拒绝，20 项）
 ├── tests/test_shipment_handover.py # pytest 测试（装车交接：冻结快照/状态版本门禁/占用唯一/并发原子性/不可变追溯/旧库升级，20 项）
+├── tests/test_shipment_review.py  # pytest 测试（发运后复核：逐批快照对比/版本或作废即待复核/只追加处置/同状态不重复/过期所见拒绝/并发一致/旧库升级，17 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -1050,6 +1172,11 @@ curl -s http://127.0.0.1:8080/api/batches/B001/handover
   （裁决版本/结论 + 出货资格版本/状态，按确认清单顺序保序）
 - `shipment_handover_occupancy`：每批全局唯一的已发运占用（`batch_no` 主键），
   数据库层兜底“任一批次已在其他交接记录发运即整单拒绝、不得重复发运”
+- `shipment_review`：已发运批次发运后复核处置的**只追加**历史（交接号+批次+
+  处置时所见的当前裁决版本/出货资格版本/作废状态 + `RECALL_REQUIRED`/`NO_RECALL`
+  处置结论与非空原因 + 处置时间）；唯一索引
+  `(handover_no, batch_no, seen_adjudication_version, seen_shipment_version, seen_batch_voided)`
+  在数据库层保证“同一所见状态不得重复处置”；交接冻结快照与核验/交接原流程不被本表改写
 
 所有写操作在单事务（`BEGIN IMMEDIATE`）内完成并进程内串行化，配合外键约束与 WAL，
 保证更正与登记的原子性：校验失败即整体回滚，不会产生半成品批次或半成品重算版本。
@@ -1058,7 +1185,8 @@ curl -s http://127.0.0.1:8080/api/batches/B001/handover
 装车交接在同一事务内完成“状态/修订号/逐批版本结论/已发运占用”全部校验与
 主记录、逐批确认快照冻结副本、全单批次占用的写入，重复交接号、未知单据、状态/版本
 冲突、任一不合格批次均整体回滚，不写入交接记录、不留下部分占用；
-新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入（含三张装车交接表），既有快照表新增列与
+新表以 `CREATE TABLE IF NOT EXISTS` 幂等加入（含三张装车交接表与发运后复核处置表
+`shipment_review` 及其唯一索引），既有快照表新增列与
 `verification.revision` 修订号列通过 `ALTER TABLE`（逐列检查）幂等补齐
 （既有单据修订号按 1 计），旧数据库启动时自动升级，
 并为既有批次补出货资格 v1（`UPGRADE_INIT`，不改变既有核验单状态；升级前的旧确认快照

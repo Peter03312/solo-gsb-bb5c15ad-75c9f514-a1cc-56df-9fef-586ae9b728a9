@@ -246,6 +246,34 @@ CREATE TABLE IF NOT EXISTS shipment_handover_occupancy (
 
 CREATE INDEX IF NOT EXISTS idx_hoccupancy_handover
     ON shipment_handover_occupancy(handover_no);
+
+-- 已发运批次的发运后质量复核处置（只追加历史）。
+-- 交接后批次更正（裁决版本）、原料待检锁定（出货资格版本）或批次作废，
+-- 使“当前所见状态”相较交接冻结快照出现任一变化时即形成待复核事项；
+-- 质检员逐批对“所见状态”记录 RECALL_REQUIRED（需召回）/ NO_RECALL（无需召回）与非空原因。
+-- 同一所见状态只允许处置一次（唯一索引兜底）；后续版本变化或新作废产生新所见状态，
+-- 批次再次待复核、可再追加一条处置记录。处置历史永不改写、不删除。
+CREATE TABLE IF NOT EXISTS shipment_review (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    handover_no              TEXT NOT NULL REFERENCES shipment_handover(handover_no),
+    batch_no                 TEXT NOT NULL REFERENCES batch(batch_no),
+    position                 INTEGER NOT NULL,      -- 冗余交接清单顺序，便于按序展示
+    -- 处置时质检员“所见状态”（乐观并发）：三类当前信息须与处置时的实际当前状态一致
+    seen_adjudication_version INTEGER NOT NULL,     -- 所见当前裁决版本
+    seen_shipment_version     INTEGER NOT NULL,     -- 所见当前出货资格版本
+    seen_batch_voided         INTEGER NOT NULL,     -- 所见批次作废状态：1=已作废 / 0=有效
+    disposition              TEXT NOT NULL,         -- RECALL_REQUIRED=需召回 / NO_RECALL=无需召回
+    reason                   TEXT NOT NULL,         -- 非空处置原因
+    reviewed_at              TEXT NOT NULL
+);
+
+-- 同一状态不得重复处置：同一交接 + 批次 + 所见三类状态至多一条处置记录
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ship_review_state_once
+    ON shipment_review(handover_no, batch_no,
+                       seen_adjudication_version, seen_shipment_version, seen_batch_voided);
+
+CREATE INDEX IF NOT EXISTS idx_ship_review_handover_batch
+    ON shipment_review(handover_no, batch_no, id);
 """
 
 # 初始化空库时写入的参考原料批号（不影响裁决的演示样例）

@@ -10,12 +10,22 @@
 """
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from typing import Any
 
 from . import allergens as al
 from .db import Store, dumps, loads
 from .errors import bad_request, conflict, not_found, unprocessable
+
+# 已发运批次发运后复核处置
+REVIEW_DISPOSITIONS = ("RECALL_REQUIRED", "NO_RECALL")
+REVIEW_DISPOSITION_LABELS = {
+    "RECALL_REQUIRED": "需召回",
+    "NO_RECALL": "无需召回",
+}
+# 复核事项状态：待复核 / 已复核 / 相较交接快照无变化（无需复核）
+REVIEW_ITEM_STATUSES = ("PENDING_REVIEW", "REVIEWED", "NO_REVIEW_REQUIRED")
 
 
 def _now() -> str:
@@ -2258,6 +2268,223 @@ class Service:
                 },
             }
 
+    # ------------------------------------------------------------ 发运后质量复核
+
+    def list_handover_reviews(self, handover_no: str) -> dict[str, Any]:
+        """按交接号查询已发运批次的逐批复核事项。
+
+        逐批并列展示交接时冻结的裁决/出货资格快照与当前版本、结论及批次作废状态：
+        相较交接快照，任一版本变化或批次作废即形成复核事项（即使结论仍为 RELEASE）。
+        - 当前所见状态尚无处置记录 -> PENDING_REVIEW（待复核）；
+        - 当前所见状态已有处置记录 -> REVIEWED（已复核），处置记入只追加历史；
+        - 相较快照无任何变化 -> NO_REVIEW_REQUIRED（无需复核）。
+        交接冻结快照与原核验流程不变，本接口为只读。
+        """
+        handover_no = (handover_no or "").strip()
+        with self.store.read() as conn:
+            hrow = conn.execute(
+                "SELECT * FROM shipment_handover WHERE handover_no = ?", (handover_no,)
+            ).fetchone()
+            if not hrow:
+                raise not_found("HANDOVER_NOT_FOUND", f"装车交接记录不存在: {handover_no}")
+            batches = _shipment_review_batches(conn, hrow)
+            return _shipment_review_board(conn, hrow, batches)
+
+    def decide_handover_review(
+        self,
+        handover_no: str,
+        batch_no: str,
+        seen_adjudication_version: int,
+        seen_shipment_version: int,
+        seen_batch_voided: bool,
+        disposition: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """质检员对已发运批次的一个“所见状态”记录复核处置（需召回/无需召回 + 非空原因）。
+
+        - 未知交接 404（HANDOVER_NOT_FOUND）；批次不属于该交接 404（BATCH_NOT_IN_HANDOVER）；
+        - 处置结论仅接受 RECALL_REQUIRED / NO_RECALL，原因为空/纯空白 400（INVALID_PAYLOAD）；
+        - 相较交接快照无变化（该所见状态本就不构成复核事项）-> 409 REVIEW_NOT_REQUIRED；
+        - 同一所见状态已处置过 -> 409 REVIEW_ALREADY_RECORDED（只追加历史不重复处置）；
+        - 提交的所见两类当前版本/作废状态与数据库当前状态不一致（过期所见状态）
+          -> 409 REVIEW_STATE_STALE；全部拒绝路径均不写入。
+        成功后向只追加历史追加一条记录，该批次对当前所见状态显示“已复核”；
+        后续版本变化或新作废产生新所见状态时再次待复核。
+        """
+        handover_no = (handover_no or "").strip()
+        batch_no = (batch_no or "").strip()
+        if not batch_no:
+            raise bad_request("INVALID_PAYLOAD", "batch_no 不能为空")
+        if not isinstance(disposition, str) or disposition.strip().upper() not in REVIEW_DISPOSITIONS:
+            raise bad_request(
+                "INVALID_PAYLOAD",
+                f"disposition 必须是 {', '.join(REVIEW_DISPOSITIONS)} 之一"
+                "（RECALL_REQUIRED=需召回 / NO_RECALL=无需召回）",
+            )
+        disposition = disposition.strip().upper()
+        reason = (reason or "").strip()
+        if not reason:
+            raise bad_request(
+                "INVALID_PAYLOAD", "reason 不能为空：发运后复核处置必须填写非空原因"
+            )
+
+        with self.store.write() as conn:
+            hrow = conn.execute(
+                "SELECT * FROM shipment_handover WHERE handover_no = ?", (handover_no,)
+            ).fetchone()
+            if not hrow:
+                raise not_found("HANDOVER_NOT_FOUND", f"装车交接记录不存在: {handover_no}")
+
+            frozen = conn.execute(
+                """SELECT hb.*, b.status AS batch_status,
+                          a.version AS cur_adj_version, a.disposition AS cur_disposition,
+                          se.version AS cur_ship_version, se.status AS cur_ship_status
+                   FROM shipment_handover_batch hb
+                   JOIN batch b ON b.batch_no = hb.batch_no
+                   LEFT JOIN adjudication a ON a.batch_no = hb.batch_no
+                   LEFT JOIN shipment_eligibility se ON se.batch_no = hb.batch_no
+                   WHERE hb.handover_no = ? AND hb.batch_no = ?""",
+                (handover_no, batch_no),
+            ).fetchone()
+            if not frozen:
+                raise not_found(
+                    "BATCH_NOT_IN_HANDOVER",
+                    f"批次不属于该交接记录: 交接 {handover_no}，批次 {batch_no}",
+                )
+
+            # 过期所见状态：以数据库当前状态为准，三类所见信息任一不符即拒绝
+            cur_voided = frozen["batch_status"] == "VOIDED"
+            stale_fields: list[dict[str, Any]] = []
+            if frozen["cur_adj_version"] is None or seen_adjudication_version != frozen["cur_adj_version"]:
+                stale_fields.append(
+                    {
+                        "field": "adjudication_version",
+                        "seen": seen_adjudication_version,
+                        "current": None if frozen["cur_adj_version"] is None else frozen["cur_adj_version"],
+                    }
+                )
+            if frozen["cur_ship_version"] is None or seen_shipment_version != frozen["cur_ship_version"]:
+                stale_fields.append(
+                    {
+                        "field": "shipment_version",
+                        "seen": seen_shipment_version,
+                        "current": None if frozen["cur_ship_version"] is None else frozen["cur_ship_version"],
+                    }
+                )
+            if bool(seen_batch_voided) != cur_voided:
+                stale_fields.append(
+                    {
+                        "field": "batch_voided",
+                        "seen": bool(seen_batch_voided),
+                        "current": cur_voided,
+                    }
+                )
+            if stale_fields:
+                raise conflict(
+                    "REVIEW_STATE_STALE",
+                    (
+                        "所见状态已过期：提交的当前裁决版本/出货资格版本/作废状态与数据库当前状态"
+                        "不一致；请重新查询复核事项获取最新所见状态后再处置"
+                    ),
+                    [
+                        {
+                            "reason_code": "REVIEW_STATE_STALE",
+                            "handover_no": handover_no,
+                            "batch_no": batch_no,
+                            "stale_fields": stale_fields,
+                            "message": "过期所见状态的复核处置整体拒绝，不写入任何处置记录",
+                        }
+                    ],
+                )
+
+            # 相较交接快照无变化：该状态不构成复核事项
+            snapshot_changed = (
+                seen_adjudication_version != frozen["snapshot_version"]
+                or seen_shipment_version != frozen["snapshot_ship_version"]
+                or cur_voided
+            )
+            if not snapshot_changed:
+                raise conflict(
+                    "REVIEW_NOT_REQUIRED",
+                    (
+                        "当前裁决版本、出货资格版本与交接冻结快照一致且批次未作废，"
+                        "相较交接快照无变化，不构成复核事项，无需处置"
+                    ),
+                )
+
+            # 同一所见状态不得重复处置（唯一索引亦在数据库层兜底并发竞争）
+            existing = conn.execute(
+                """SELECT id FROM shipment_review
+                   WHERE handover_no = ? AND batch_no = ?
+                     AND seen_adjudication_version = ?
+                     AND seen_shipment_version = ?
+                     AND seen_batch_voided = ?""",
+                (
+                    handover_no,
+                    batch_no,
+                    seen_adjudication_version,
+                    seen_shipment_version,
+                    1 if seen_batch_voided else 0,
+                ),
+            ).fetchone()
+            if existing:
+                raise conflict(
+                    "REVIEW_ALREADY_RECORDED",
+                    (
+                        "该批次此所见状态（当前裁决版本/出货资格版本/作废状态）已复核处置；"
+                        "同一状态不得重复处置。如后续产生新版本或新作废，批次会再次待复核"
+                    ),
+                    [
+                        {
+                            "reason_code": "REVIEW_ALREADY_RECORDED",
+                            "handover_no": handover_no,
+                            "batch_no": batch_no,
+                            "seen_adjudication_version": seen_adjudication_version,
+                            "seen_shipment_version": seen_shipment_version,
+                            "seen_batch_voided": bool(seen_batch_voided),
+                            "existing_review_id": existing["id"],
+                        }
+                    ],
+                )
+
+            now = _now()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO shipment_review
+                       (handover_no, batch_no, position,
+                        seen_adjudication_version, seen_shipment_version, seen_batch_voided,
+                        disposition, reason, reviewed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        handover_no,
+                        batch_no,
+                        frozen["position"],
+                        seen_adjudication_version,
+                        seen_shipment_version,
+                        1 if seen_batch_voided else 0,
+                        disposition,
+                        reason,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                # 并发下唯一索引兜底：同一所见状态只允许处置一次
+                raise conflict(
+                    "REVIEW_ALREADY_RECORDED",
+                    "该批次此所见状态已复核处置（并发提交），同一状态不得重复处置",
+                ) from exc
+
+            hb_row = conn.execute(
+                "SELECT * FROM shipment_handover WHERE handover_no = ?", (handover_no,)
+            ).fetchone()
+            item = _shipment_review_batches(conn, hb_row, batch_nos=(batch_no,))
+            return {
+                "handover_no": handover_no,
+                "review_id": cur.lastrowid,
+                "reviewed": True,
+                "batch": item[0],
+            }
+
 
 # ---------------------------------------------------------------- 出货核验单
 
@@ -2829,4 +3056,229 @@ def _handover_summary(conn, row) -> dict[str, Any]:
         "batch_count": row["batch_count"],
         "handed_over_at": row["handed_over_at"],
         "batches": members,
+    }
+
+
+# ---------------------------------------------------------------- 发运后质量复核序列化
+
+
+def _review_history(conn, handover_no: str, batch_no: str) -> list[dict[str, Any]]:
+    """单批复核处置的只追加历史（按处置先后）。"""
+    rows = conn.execute(
+        """SELECT id, position, seen_adjudication_version, seen_shipment_version,
+                  seen_batch_voided, disposition, reason, reviewed_at
+           FROM shipment_review
+           WHERE handover_no = ? AND batch_no = ? ORDER BY id""",
+        (handover_no, batch_no),
+    ).fetchall()
+    return [
+        {
+            "review_id": r["id"],
+            "position": r["position"],
+            "seen_state": {
+                "adjudication_version": r["seen_adjudication_version"],
+                "shipment_version": r["seen_shipment_version"],
+                "batch_voided": r["seen_batch_voided"] == 1,
+            },
+            "disposition": r["disposition"],
+            "disposition_label": REVIEW_DISPOSITION_LABELS.get(
+                r["disposition"], r["disposition"]
+            ),
+            "reason": r["reason"],
+            "reviewed_at": r["reviewed_at"],
+        }
+        for r in rows
+    ]
+
+
+def _shipment_review_batches(conn, hrow, batch_nos: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+    """组装交接复核的逐批记录：交接冻结快照 vs 当前版本/结论/作废状态 + 复核状态与历史。
+
+    仅读取，不依赖核验单当前状态——交接记录本身不可变，复核以其冻结快照为基准。
+    """
+    sql = """SELECT hb.position AS position, hb.batch_no AS batch_no,
+                    hb.snapshot_version AS snap_version,
+                    hb.snapshot_disposition AS snap_disposition,
+                    hb.snapshot_actual AS snap_actual,
+                    hb.snapshot_undeclared AS snap_undeclared,
+                    hb.snapshot_reasons AS snap_reasons,
+                    hb.snapshot_ship_version AS snap_ship_version,
+                    hb.snapshot_ship_status AS snap_ship_status,
+                    hb.snapshot_locked_lots AS snap_locked_lots,
+                    hb.snapshot_ship_reasons AS snap_ship_reasons,
+                    b.status AS batch_status,
+                    b.voided_reason AS voided_reason, b.voided_at AS voided_at,
+                    a.version AS cur_adj_version, a.disposition AS cur_disposition,
+                    a.actual AS cur_actual, a.undeclared AS cur_undeclared,
+                    a.reasons AS cur_adj_reasons, a.decided_at AS cur_adj_decided_at,
+                    se.version AS cur_ship_version, se.status AS cur_ship_status,
+                    se.locked_lots AS cur_locked_lots,
+                    se.reasons AS cur_ship_reasons, se.updated_at AS cur_ship_updated_at
+             FROM shipment_handover_batch hb
+             JOIN batch b ON b.batch_no = hb.batch_no
+             LEFT JOIN adjudication a ON a.batch_no = hb.batch_no
+             LEFT JOIN shipment_eligibility se ON se.batch_no = hb.batch_no
+             WHERE hb.handover_no = ?"""
+    params: list[Any] = [hrow["handover_no"]]
+    if batch_nos is not None:
+        placeholders = ",".join("?" * len(batch_nos))
+        sql += f" AND hb.batch_no IN ({placeholders})"
+        params.extend(batch_nos)
+    sql += " ORDER BY hb.position"
+    rows = conn.execute(sql, params).fetchall()
+
+    batches: list[dict[str, Any]] = []
+    for r in rows:
+        bn = r["batch_no"]
+        cur_voided = r["batch_status"] == "VOIDED"
+
+        adj_changed = (
+            r["cur_adj_version"] is not None
+            and r["cur_adj_version"] != r["snap_version"]
+        )
+        ship_changed = (
+            r["cur_ship_version"] is not None
+            and r["snap_ship_version"] is not None
+            and r["cur_ship_version"] != r["snap_ship_version"]
+        )
+        needs_review = adj_changed or ship_changed or cur_voided
+
+        current_adjudication = None
+        if r["cur_adj_version"] is not None:
+            current_adjudication = {
+                "version": r["cur_adj_version"],
+                "disposition": r["cur_disposition"],
+                "actual_allergens": loads(r["cur_actual"]),
+                "undeclared_allergens": loads(r["cur_undeclared"]),
+                "reasons": loads(r["cur_adj_reasons"]),
+                "decided_at": r["cur_adj_decided_at"],
+            }
+        current_eligibility = None
+        if r["cur_ship_version"] is not None:
+            current_eligibility = {
+                "version": r["cur_ship_version"],
+                "status": r["cur_ship_status"],
+                "locked_lots": loads(r["cur_locked_lots"]),
+                "reasons": loads(r["cur_ship_reasons"]),
+                "updated_at": r["cur_ship_updated_at"],
+            }
+
+        # 批次作废本身单列一条变化原因（作废不追加裁决/资格版本）
+        change_reasons = list(
+            _change_reasons(conn, bn, r["snap_version"])
+        ) if adj_changed else []
+        shipment_change_reasons = list(
+            _shipment_change_reasons(conn, bn, r["snap_ship_version"])
+        ) if ship_changed else []
+        if cur_voided:
+            change_reasons.append(
+                {
+                    "code": "BATCH_VOIDED",
+                    "message": (
+                        "批次已于交接后作废（误登记、实际未投产）；作废保留原登记与历史，"
+                        "但已发运批次须复核召回风险"
+                    ),
+                    "voided_reason": r["voided_reason"],
+                    "voided_at": r["voided_at"],
+                }
+            )
+
+        history = _review_history(conn, hrow["handover_no"], bn)
+        if needs_review:
+            # 当前所见状态是否已由质检员处置过（只追加历史中存在匹配三类所见状态的记录）
+            seen_state = {
+                "adjudication_version": None
+                if r["cur_adj_version"] is None
+                else r["cur_adj_version"],
+                "shipment_version": None
+                if r["cur_ship_version"] is None
+                else r["cur_ship_version"],
+                "batch_voided": cur_voided,
+            }
+            latest = next(
+                (
+                    h
+                    for h in reversed(history)
+                    if h["seen_state"] == seen_state
+                ),
+                None,
+            )
+            if latest is None:
+                review_status = "PENDING_REVIEW"
+            else:
+                review_status = "REVIEWED"
+        else:
+            seen_state = {
+                "adjudication_version": r["snap_version"],
+                "shipment_version": r["snap_ship_version"],
+                "batch_voided": False,
+            }
+            latest = None
+            review_status = "NO_REVIEW_REQUIRED"
+
+        batches.append(
+            {
+                "position": r["position"],
+                "batch_no": bn,
+                "status": r["batch_status"],
+                "voided": cur_voided,
+                "voided_reason": r["voided_reason"],
+                "voided_at": r["voided_at"],
+                # 交接时冻结、不可变的快照
+                "handover_snapshot": {
+                    "adjudication": {
+                        "version": r["snap_version"],
+                        "disposition": r["snap_disposition"],
+                        "actual_allergens": loads(r["snap_actual"]),
+                        "undeclared_allergens": loads(r["snap_undeclared"]),
+                        "reasons": loads(r["snap_reasons"]),
+                    },
+                    "shipment_eligibility": {
+                        "version": r["snap_ship_version"],
+                        "status": r["snap_ship_status"],
+                        "locked_lots": loads(r["snap_locked_lots"]),
+                        "reasons": loads(r["snap_ship_reasons"]),
+                    },
+                },
+                # 当前版本、结论与作废状态（质检员所见的两类当前版本）
+                "current": {
+                    "adjudication": current_adjudication,
+                    "shipment_eligibility": current_eligibility,
+                },
+                "adjudication_changed": adj_changed,
+                "shipment_eligibility_changed": ship_changed,
+                "change_reasons": change_reasons,
+                "shipment_change_reasons": shipment_change_reasons,
+                "needs_review": needs_review,
+                "review_status": review_status,
+                # 提交处置时须原样回传的所见状态（乐观并发）
+                "seen_state": seen_state,
+                "latest_review": latest,
+                "reviews": history,
+            }
+        )
+    return batches
+
+
+def _shipment_review_board(conn, hrow, batches: list[dict[str, Any]]) -> dict[str, Any]:
+    """交接复核事项列表负载：交接头信息 + 逐批事项 + 汇总计数。"""
+    pending = [b["batch_no"] for b in batches if b["review_status"] == "PENDING_REVIEW"]
+    reviewed = [b["batch_no"] for b in batches if b["review_status"] == "REVIEWED"]
+    no_review = [b["batch_no"] for b in batches if b["review_status"] == "NO_REVIEW_REQUIRED"]
+    return {
+        "handover_no": hrow["handover_no"],
+        "verification_no": hrow["verification_no"],
+        "verification_revision": hrow["verification_revision"],
+        "confirmation_id": hrow["confirmation_id"],
+        "confirmed_at": hrow["confirmed_at"],
+        "handed_over_at": hrow["handed_over_at"],
+        "batch_count": hrow["batch_count"],
+        "summary": {
+            "pending_review": len(pending),
+            "reviewed": len(reviewed),
+            "no_review_required": len(no_review),
+            "pending_batches": pending,
+            "reviewed_batches": reviewed,
+        },
+        "batches": batches,
     }

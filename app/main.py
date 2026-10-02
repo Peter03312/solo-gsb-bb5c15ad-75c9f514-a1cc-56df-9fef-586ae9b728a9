@@ -17,6 +17,7 @@ from .schemas import (
     LotLockIn,
     MaterialLotCorrection,
     MaterialLotIn,
+    ShipmentReviewDecisionIn,
     VerificationIn,
     VerificationReviseIn,
 )
@@ -277,6 +278,48 @@ def create_app(db_path: str | None = None, seed_demo: bool | None = None) -> Fas
     def get_batch_handover(batch_no: str, service: Service = Depends(svc)):
         """追溯单批的交接归属（未发运返回 shipped=false；未知批次 404）。"""
         return service.get_batch_handover(batch_no)
+
+    # ---------------- 已发运批次发运后质量复核 ----------------
+
+    @app.get("/api/handovers/{handover_no}/reviews", tags=["发运后质量复核"])
+    def list_handover_reviews(handover_no: str, service: Service = Depends(svc)):
+        """按交接号逐批查询发运后复核事项：并列交接冻结快照与当前版本、结论及作废状态。
+
+        相较交接快照，任一裁决/出货资格版本变化或批次作废均形成复核事项（即使结论仍为
+        RELEASE）。逐批返回 review_status：PENDING_REVIEW（待复核）/ REVIEWED（已复核）/
+        NO_REVIEW_REQUIRED（相较快照无变化），并给出提交处置须原样回传的 seen_state
+        （两类当前版本 + 作废状态）与只追加处置历史。交接快照与原核验流程保持不变。
+        未知交接 404。
+        """
+        return service.list_handover_reviews(handover_no)
+
+    @app.post(
+        "/api/handovers/{handover_no}/reviews/{batch_no}/decision",
+        tags=["发运后质量复核"],
+        status_code=201,
+    )
+    def decide_handover_review(
+        handover_no: str, body: ShipmentReviewDecisionIn, batch_no: str,
+        service: Service = Depends(svc),
+    ):
+        """质检员对已发运批次的一个“所见状态”记录复核处置（需召回/无需召回 + 非空原因）。
+
+        凭查询复核事项时所见的两类当前版本（裁决/出货资格）与作废状态提交；处置写入
+        只追加历史后该批次对当前所见状态显示已复核，后续版本变化或新作废再次待复核。
+        同一所见状态不得重复处置（REVIEW_ALREADY_RECORDED）；无变化状态处置拒绝
+        （REVIEW_NOT_REQUIRED）；过期所见状态拒绝（REVIEW_STATE_STALE）；
+        未知交接 404、批次不属于该交接 404；非法处置结论或空原因 400；
+        所有拒绝路径均不写入。交接快照和原核验流程不变。
+        """
+        return service.decide_handover_review(
+            handover_no,
+            batch_no,
+            body.seen_adjudication_version,
+            body.seen_shipment_version,
+            body.seen_batch_voided,
+            body.disposition,
+            body.reason,
+        )
 
     return app
 
